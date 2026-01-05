@@ -5,6 +5,7 @@ This test verifies that the stdio-to-http-converter works correctly with an MCP 
 ## Overview
 
 The test:
+
 1. Builds a Docker image containing the converter and a test MCP server (calculator)
 2. Runs the container locally
 3. Connects to the container using an MCP client
@@ -48,4 +49,3 @@ go test -v .
 - **MCP Server**: `@wrtnlabs/calculator-mcp@latest` (via npx)
 
 The test automatically cleans up the container and image after completion (or on failure).
-
