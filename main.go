@@ -76,7 +76,7 @@ func withCORS(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Expose-Headers", "Mcp-Session-Id, Content-Type")
 
 		// Wrap the ResponseWriter to ensure CORS headers are always set
-		corsW := &corsResponseWriter{ResponseWriter: w}
+		corsW := newCorsResponseWriter(w)
 		next.ServeHTTP(corsW, r)
 	})
 }
@@ -84,7 +84,22 @@ func withCORS(next http.Handler) http.Handler {
 // corsResponseWriter wraps http.ResponseWriter to ensure CORS headers are set
 type corsResponseWriter struct {
 	http.ResponseWriter
+	flusher        http.Flusher
 	headersWritten bool
+}
+
+func newCorsResponseWriter(w http.ResponseWriter) *corsResponseWriter {
+	cw := &corsResponseWriter{ResponseWriter: w}
+	if f, ok := w.(http.Flusher); ok {
+		cw.flusher = f
+	}
+	return cw
+}
+
+func (w *corsResponseWriter) Flush() {
+	if w.flusher != nil {
+		w.flusher.Flush()
+	}
 }
 
 func (w *corsResponseWriter) WriteHeader(status int) {

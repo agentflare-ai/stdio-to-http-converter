@@ -129,6 +129,8 @@ type Converter struct {
 	cmd           *exec.Cmd
 	sessionsMu    sync.Mutex
 	sessions      map[string]*session
+	pendingSSEMu  sync.Mutex
+	pendingSSE    []*sseConn // SSE connections waiting for session creation
 }
 
 func NewConverter(cmdStr string, transportType string, internalPort string) *Converter {
@@ -136,6 +138,7 @@ func NewConverter(cmdStr string, transportType string, internalPort string) *Con
 		cmdStr:        cmdStr,
 		transportType: transportType,
 		sessions:      make(map[string]*session),
+		pendingSSE:    make([]*sseConn, 0),
 	}
 
 	if transportType == "http" || transportType == "sse" {
@@ -200,6 +203,17 @@ func (p *Converter) handlePOST(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "failed to start session", http.StatusInternalServerError)
 			return
 		}
+
+		// Associate any pending SSE connections with this new session
+		p.pendingSSEMu.Lock()
+		if len(p.pendingSSE) > 0 {
+			s.serverMsgMu.Lock()
+			s.sseConns = append(s.sseConns, p.pendingSSE...)
+			s.serverMsgMu.Unlock()
+			p.pendingSSE = nil // Clear pending connections
+		}
+		p.pendingSSEMu.Unlock()
+
 		// forward request and wait for response
 		resp, err := p.forwardRequestAwaitResponse(s, body, msg)
 		if err != nil {
@@ -207,6 +221,19 @@ func (p *Converter) handlePOST(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "upstream error", http.StatusBadGateway)
 			return
 		}
+
+		// Also send the initialize response over SSE if there are SSE connections
+		s.serverMsgMu.Lock()
+		if len(s.sseConns) > 0 {
+			// Send response over SSE as well
+			s.lastEventSeq++
+			idStr := fmt.Sprintf("%d", s.lastEventSeq)
+			for _, conn := range s.sseConns {
+				_ = conn.WriteEvent(resp, idStr)
+			}
+		}
+		s.serverMsgMu.Unlock()
+
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Mcp-Session-Id", s.id)
 		w.WriteHeader(http.StatusOK)
@@ -252,15 +279,6 @@ func (p *Converter) handlePOST(w http.ResponseWriter, r *http.Request) {
 
 func (p *Converter) handleGET(w http.ResponseWriter, r *http.Request) {
 	sessID := r.Header.Get("Mcp-Session-Id")
-	if sessID == "" {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	s := p.getSession(sessID)
-	if s == nil {
-		http.Error(w, "unknown session", http.StatusNotFound)
-		return
-	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -273,6 +291,38 @@ func (p *Converter) handleGET(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	sconn := newSSEConn(w, r)
+
+	if sessID == "" {
+		// No session ID - store as pending SSE connection
+		// It will be associated with a session when initialize POST arrives
+		p.pendingSSEMu.Lock()
+		p.pendingSSE = append(p.pendingSSE, sconn)
+		p.pendingSSEMu.Unlock()
+
+		// block until client disconnects
+		<-r.Context().Done()
+		sconn.Close()
+
+		// Remove from pending if still there
+		p.pendingSSEMu.Lock()
+		var active []*sseConn
+		for _, c := range p.pendingSSE {
+			if c != sconn {
+				active = append(active, c)
+			}
+		}
+		p.pendingSSE = active
+		p.pendingSSEMu.Unlock()
+		return
+	}
+
+	// Session ID provided - use existing session
+	s := p.getSession(sessID)
+	if s == nil {
+		http.Error(w, "unknown session", http.StatusNotFound)
+		return
+	}
+
 	// register connection
 	s.serverMsgMu.Lock()
 	s.sseConns = append(s.sseConns, sconn)
@@ -430,6 +480,17 @@ func (p *Converter) readStdoutLoop(s *session) {
 	scanner.Buffer(buf, 10*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Bytes()
+		// Skip lines that don't look like JSON (don't start with '{' or '[')
+		// This filters out startup messages, warnings, etc. from tools like npx
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			continue
+		}
+		firstChar := trimmed[0]
+		if firstChar != '{' && firstChar != '[' {
+			// Not JSON, likely a startup message or warning - skip it silently
+			continue
+		}
 		// parse JSON-RPC
 		var msg jsonrpcMessage
 		if err := json.Unmarshal(line, &msg); err != nil {
@@ -481,7 +542,8 @@ func (p *Converter) streamToAnySSE(s *session, payload []byte) {
 func (p *Converter) readStderrLoop(s *session) {
 	scanner := bufio.NewScanner(s.stderr)
 	for scanner.Scan() {
-		log.Printf("[%s][stderr] %s", s.id, scanner.Text())
+		// Silently discard stderr output from MCP server
+		_ = scanner.Text()
 	}
 }
 
